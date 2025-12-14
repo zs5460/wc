@@ -1,7 +1,7 @@
 # wc
 
 
-极简，无依赖，专用于企业微信收发文本消息。
+极简，无依赖，专用于企业微信发送文本消息。
 
 ## 快速开始
 
@@ -15,7 +15,7 @@ import (
 
 func main() {
 	
-	app := wc.New("yourAppID","yourSecret","yourAgentId")
+	app, _ := wc.New("yourAppID","yourSecret","yourAgentId")
 
     // 推送消息
 	app.Send("@all", "Hello,World!")
