@@ -12,11 +12,9 @@ import (
 )
 
 const (
-	conBaseURL = "https://qyapi.weixin.qq.com/cgi-bin/"
-	// conGetTokenURL ...
+	conBaseURL     = "https://qyapi.weixin.qq.com/cgi-bin/"
 	conGetTokenURL = conBaseURL + "gettoken?corpid=%s&corpsecret=%s"
-	// conSendMsgURL ...
-	conSendMsgURL = conBaseURL + "message/send?access_token=%s"
+	conSendMsgURL  = conBaseURL + "message/send?access_token=%s"
 )
 
 type wechat struct {
@@ -62,7 +60,7 @@ func New(appid, appkey, agentid string) (*wechat, error) {
 }
 
 func (wc *wechat) tokenRefresher() {
-	ticker := time.NewTicker(1800 * time.Second)
+	ticker := time.NewTicker(1600 * time.Second)
 	defer ticker.Stop()
 	for {
 		select {
@@ -130,7 +128,6 @@ func (wc *wechat) Close() {
 	wc.cancel()
 }
 
-// getJSON get json from a url and unmarshal to a struct.
 func getJSON(url string, v any) error {
 	resp, err := http.Get(url)
 	if err != nil {
@@ -141,8 +138,6 @@ func getJSON(url string, v any) error {
 	return json.Unmarshal(reply, v)
 }
 
-// postJSON request a url with POST method
-// params is a json string
 func postJSON(url string, params string) (reply []byte, err error) {
 	resp, err := http.Post(url,
 		"application/json;charset=UTF-8",
