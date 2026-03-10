@@ -65,7 +65,7 @@ func (wc *wechat) tokenRefresher() {
 	for {
 		select {
 		case <-ticker.C:
-			wc.getToken()
+			_ = wc.getToken()
 		case <-wc.ctx.Done():
 			return
 		}
@@ -133,7 +133,9 @@ func getJSON(url string, v any) error {
 	if err != nil {
 		return err
 	}
-	defer resp.Body.Close()
+	defer func() {
+		_ = resp.Body.Close()
+	}()
 	reply, _ := io.ReadAll(resp.Body)
 	return json.Unmarshal(reply, v)
 }
@@ -145,7 +147,9 @@ func postJSON(url string, params string) (reply []byte, err error) {
 	if err != nil {
 		return
 	}
-	defer resp.Body.Close()
+	defer func() {
+		_ = resp.Body.Close()
+	}()
 	reply, err = io.ReadAll(resp.Body)
 	return
 }
