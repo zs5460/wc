@@ -1,30 +1,36 @@
 package wc
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
-	"strings"
 	"sync"
 	"time"
 )
 
 const (
-	conBaseURL     = "https://qyapi.weixin.qq.com/cgi-bin/"
-	conGetTokenURL = conBaseURL + "gettoken?corpid=%s&corpsecret=%s"
-	conSendMsgURL  = conBaseURL + "message/send?access_token=%s"
+	baseURL     = "https://qyapi.weixin.qq.com/cgi-bin/"
+	getTokenURL = baseURL + "gettoken?corpid=%s&corpsecret=%s"
+	sendMsgURL  = baseURL + "message/send?access_token=%s"
+	// 企业微信 access_token 有效期 7200s，提前刷新避免边界失败
+	tokenRefreshInterval = 3600 * time.Second
+	httpTimeout          = 10 * time.Second
 )
 
+const httpStatusErrFmt = "unexpected HTTP status %d: %s"
+
 type wechat struct {
-	AppID       string
-	AppKey      string
-	AgentID     string
-	AccessToken string
+	appID       string
+	appKey      string
+	agentID     string
+	accessToken string
 	mu          sync.RWMutex
 	ctx         context.Context
 	cancel      context.CancelFunc
+	client      *http.Client
 }
 
 type result struct {
@@ -33,26 +39,31 @@ type result struct {
 	Token   string `json:"access_token"`
 }
 
+type textBody struct {
+	Content string `json:"content"`
+}
+
 type message struct {
-	ToUser  string `json:"touser"`
-	MsgType string `json:"msgtype"`
-	AgentID string `json:"agentid"`
-	Text    struct {
-		Content string `json:"content"`
-	} `json:"text"`
+	ToUser  string   `json:"touser"`
+	MsgType string   `json:"msgtype"`
+	AgentID string   `json:"agentid"`
+	Text    textBody `json:"text"`
 }
 
 func New(appid, appkey, agentid string) (*wechat, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 	wc := &wechat{
-		AppID:   appid,
-		AppKey:  appkey,
-		AgentID: agentid,
+		appID:   appid,
+		appKey:  appkey,
+		agentID: agentid,
 		ctx:     ctx,
 		cancel:  cancel,
+		client: &http.Client{
+			Timeout: httpTimeout,
+		},
 	}
-	err := wc.getToken()
-	if err != nil {
+	if err := wc.getToken(); err != nil {
+		cancel()
 		return nil, err
 	}
 	go wc.tokenRefresher()
@@ -60,7 +71,7 @@ func New(appid, appkey, agentid string) (*wechat, error) {
 }
 
 func (wc *wechat) tokenRefresher() {
-	ticker := time.NewTicker(1600 * time.Second)
+	ticker := time.NewTicker(tokenRefreshInterval)
 	defer ticker.Stop()
 	for {
 		select {
@@ -74,52 +85,42 @@ func (wc *wechat) tokenRefresher() {
 
 func (wc *wechat) getToken() error {
 	var ret result
-	url := fmt.Sprintf(conGetTokenURL, wc.AppID, wc.AppKey)
-	err := getJSON(url, &ret)
-	if err != nil {
-		return err
+	url := fmt.Sprintf(getTokenURL, wc.appID, wc.appKey)
+	if err := wc.getJSON(url, &ret); err != nil {
+		return fmt.Errorf("get token request: %w", err)
 	}
 	if ret.Code != 0 {
-		return fmt.Errorf("get token failed: %s", ret.Message)
+		return fmt.Errorf("get token failed (errcode=%d): %s", ret.Code, ret.Message)
 	}
 	wc.mu.Lock()
-	wc.AccessToken = ret.Token
+	wc.accessToken = ret.Token
 	wc.mu.Unlock()
 	return nil
 }
 
 func (wc *wechat) Send(to, msg string) error {
-	var ret result
-	wc.mu.RLock()
-	url := fmt.Sprintf(conSendMsgURL, wc.AccessToken)
-	wc.mu.RUnlock()
+	url := fmt.Sprintf(sendMsgURL, wc.token())
+
 	m := message{
 		ToUser:  to,
 		MsgType: "text",
-		AgentID: wc.AgentID,
-		Text: struct {
-			Content string `json:"content"`
-		}{
-			Content: msg,
-		},
+		AgentID: wc.agentID,
+		Text:    textBody{Content: msg},
 	}
 
 	data, err := json.Marshal(m)
 	if err != nil {
-		return fmt.Errorf("marshal message error: %w", err)
+		return fmt.Errorf("marshal message: %w", err)
 	}
 
-	reply, err := postJSON(url, string(data))
+	var ret result
+	err = wc.doJSON(http.MethodPost, url, data, &ret)
 	if err != nil {
-		return fmt.Errorf("post URL error: %w", err)
+		return fmt.Errorf("send request error: %w", err)
 	}
 
-	err = json.Unmarshal(reply, &ret)
-	if err != nil {
-		return fmt.Errorf("unmarshal reply error: %w", err)
-	}
 	if ret.Code != 0 {
-		return fmt.Errorf("send message failed: %s", ret.Message)
+		return fmt.Errorf("send message failed (errcode=%d): %s", ret.Code, ret.Message)
 	}
 	return nil
 }
@@ -128,28 +129,45 @@ func (wc *wechat) Close() {
 	wc.cancel()
 }
 
-func getJSON(url string, v any) error {
-	resp, err := http.Get(url)
-	if err != nil {
-		return err
-	}
-	defer func() {
-		_ = resp.Body.Close()
-	}()
-	reply, _ := io.ReadAll(resp.Body)
-	return json.Unmarshal(reply, v)
+func (wc *wechat) getJSON(url string, v any) error {
+	return wc.doJSON(http.MethodGet, url, nil, v)
 }
 
-func postJSON(url string, params string) (reply []byte, err error) {
-	resp, err := http.Post(url,
-		"application/json;charset=UTF-8",
-		strings.NewReader(params))
-	if err != nil {
-		return
+func (wc *wechat) doJSON(method, url string, body []byte, v any) error {
+	var reqBody io.Reader
+	if body != nil {
+		reqBody = bytes.NewReader(body)
 	}
-	defer func() {
-		_ = resp.Body.Close()
-	}()
-	reply, err = io.ReadAll(resp.Body)
-	return
+
+	req, err := http.NewRequestWithContext(wc.ctx, method, url, reqBody)
+	if err != nil {
+		return fmt.Errorf("build %s request: %w", method, err)
+	}
+	if method == http.MethodPost {
+		req.Header.Set("Content-Type", "application/json;charset=UTF-8")
+	}
+
+	resp, err := wc.client.Do(req)
+	if err != nil {
+		return fmt.Errorf("%s request failed: %w", method, err)
+	}
+	defer resp.Body.Close()
+
+	reply, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return fmt.Errorf("read %s response body: %w", method, err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf(httpStatusErrFmt, resp.StatusCode, bytes.TrimSpace(reply))
+	}
+	if err := json.Unmarshal(reply, v); err != nil {
+		return fmt.Errorf("decode %s response: %w", method, err)
+	}
+	return nil
+}
+
+func (wc *wechat) token() string {
+	wc.mu.RLock()
+	defer wc.mu.RUnlock()
+	return wc.accessToken
 }
